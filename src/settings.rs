@@ -107,7 +107,11 @@ pub fn autostart_enabled() -> bool {
         return false;
     };
     std::env::current_exe()
-        .map(|exe| value.trim_matches('"').eq_ignore_ascii_case(&exe.display().to_string()))
+        .map(|exe| {
+            value
+                .trim_matches('"')
+                .eq_ignore_ascii_case(&exe.display().to_string())
+        })
         .unwrap_or(false)
 }
 

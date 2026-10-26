@@ -11,8 +11,8 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 pub enum TrayCommand {
     OpenSettings,
     RefreshNow,
-    /// Show (`true`) or hide the overlay.
-    ShowOverlay(bool),
+    /// "Overlay anzeigen" was clicked; see [`Tray::overlay_checked`].
+    ToggleOverlay,
     Quit,
 }
 
@@ -41,7 +41,7 @@ impl Tray {
 
         let (tx, rx) = mpsc::channel();
         {
-            let (tx, ctx, show) = (tx.clone(), ctx.clone(), show.clone());
+            let (tx, ctx) = (tx.clone(), ctx.clone());
             let ids = (
                 settings.id().clone(),
                 refresh.id().clone(),
@@ -54,7 +54,7 @@ impl Tray {
                 } else if e.id == ids.1 {
                     TrayCommand::RefreshNow
                 } else if e.id == ids.2 {
-                    TrayCommand::ShowOverlay(show.is_checked())
+                    TrayCommand::ToggleOverlay
                 } else if e.id == ids.3 {
                     TrayCommand::Quit
                 } else {
@@ -94,6 +94,11 @@ impl Tray {
 
     pub fn try_recv(&self) -> Option<TrayCommand> {
         self.commands.try_recv().ok()
+    }
+
+    /// State of the "Overlay anzeigen" check mark (toggled by the menu itself).
+    pub fn overlay_checked(&self) -> bool {
+        self.show_item.is_checked()
     }
 
     /// Keeps the "Overlay anzeigen" check mark in sync.
@@ -191,12 +196,16 @@ fn decode_png(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => buf
-            .chunks_exact(3)
-            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|[r, g, b]| [*r, *g, *b, 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => buf
-            .chunks_exact(2)
-            .flat_map(|c| [c[0], c[0], c[0], c[1]])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|[g, a]| [*g, *g, *g, *a])
             .collect(),
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::Indexed => return None,
@@ -218,7 +227,8 @@ fn fallback_icon(size: u32) -> (Vec<u8>, u32, u32) {
         for x in 0..size as i32 {
             let body = x >= l && x < r && y >= t && y < b;
             let inner = x >= l + stroke && x < r - stroke && y >= t + stroke && y < b - stroke;
-            let fill = x >= l + 2 * stroke && x < px(19.0) && y >= t + 2 * stroke && y < b - 2 * stroke;
+            let fill =
+                x >= l + 2 * stroke && x < px(19.0) && y >= t + 2 * stroke && y < b - 2 * stroke;
             let nub = x >= r && x < nub_r && y >= nub_t && y < nub_b;
             let color = if fill {
                 Some(FILL)
@@ -263,7 +273,12 @@ mod tests {
             &[
                 dev("Maus", Link::Online, Some(176), Charging::Charging),
                 dev("Headset", Link::Asleep, Some(10), Charging::Unknown),
-                dev("X", Link::Error("kaputt".into()), Some(255), Charging::Discharging),
+                dev(
+                    "X",
+                    Link::Error("kaputt".into()),
+                    Some(255),
+                    Charging::Discharging,
+                ),
             ],
             true,
         );
@@ -277,6 +292,6 @@ mod tests {
     fn fallback_icon_has_pixels() {
         let (rgba, w, h) = fallback_icon(32);
         assert_eq!(rgba.len(), (w * h * 4) as usize);
-        assert!(rgba.chunks_exact(4).any(|p| p[3] == 255));
+        assert!(rgba.as_chunks::<4>().0.iter().any(|p| p[3] == 255));
     }
 }

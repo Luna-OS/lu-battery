@@ -307,7 +307,13 @@ fn poll_loop(
         // Several queued refresh requests make one refresh.
         let mut next = Some(first);
         while let Some(cmd) = next.take() {
-            if !handle_command(cmd, &mut interval, &mut next_poll, &mut next_scan, &mut force) {
+            if !handle_command(
+                cmd,
+                &mut interval,
+                &mut next_poll,
+                &mut next_scan,
+                &mut force,
+            ) {
                 return;
             }
             next = commands.try_recv().ok().map(Ok);
@@ -496,7 +502,14 @@ pub fn probe() -> anyhow::Result<()> {
         .device_list()
         .filter(|d| d.vendor_id() == RAZER_VID)
         .collect();
-    all.sort_by_key(|d| (d.product_id(), d.interface_number(), d.usage_page(), d.usage()));
+    all.sort_by_key(|d| {
+        (
+            d.product_id(),
+            d.interface_number(),
+            d.usage_page(),
+            d.usage(),
+        )
+    });
     for d in &all {
         let known = devices::lookup(d.product_id())
             .map(|i| i.name)

@@ -87,7 +87,12 @@ mod tests {
     #[test]
     fn known_devices() {
         let b = lookup(0x00AB).unwrap();
-        assert_eq!(b.driver, Driver::Standard { transaction_id: 0x1F });
+        assert_eq!(
+            b.driver,
+            Driver::Standard {
+                transaction_id: 0x1F
+            }
+        );
         assert_eq!(b.id(), "1532:00ab");
         assert_eq!(lookup(0x00AA).unwrap().id(), "1532:00ab");
         assert_eq!(lookup(0x0550).unwrap().kind, DeviceKind::Headset);
