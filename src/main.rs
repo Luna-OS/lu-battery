@@ -3,8 +3,12 @@
 
 mod model;
 mod razer;
+#[allow(dead_code)]
 mod ui;
 
-fn main() {
-    println!("lu-battery");
+fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--probe") {
+        return razer::probe();
+    }
+    Ok(())
 }
