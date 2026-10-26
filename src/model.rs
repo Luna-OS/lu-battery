@@ -24,9 +24,20 @@ pub enum Charging {
     Unknown,
 }
 
+/// Where a reading came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadSource {
+    /// Read directly from the device over HID (exact raw value).
+    Hid,
+    /// Taken from Razer Synapse's log (whole percent, `raw_max == 100`);
+    /// only used as a fallback when the HID read fails.
+    Synapse,
+}
+
 /// One battery reading, exactly as the device reported it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BatteryReading {
+    pub source: ReadSource,
     /// Raw value from the device (Razer mice: 0..=255, headsets: device-specific).
     pub raw: u16,
     /// The largest raw value, so `percent` is exact and never guessed.
@@ -113,7 +124,7 @@ pub struct Settings {
     /// Mouse clicks pass through the overlay (settings via tray then).
     pub click_through: bool,
     pub always_on_top: bool,
-    /// Seconds between battery reads, 5..=300.
+    /// Seconds between battery reads, 2..=300.
     pub poll_secs: u32,
     /// Below this percent the device is shown as low (warning colour).
     pub low_threshold: u8,
@@ -140,7 +151,7 @@ impl Default for Settings {
             precise_percent: false,
             click_through: false,
             always_on_top: true,
-            poll_secs: 30,
+            poll_secs: 5,
             low_threshold: 20,
             critical_threshold: 10,
             hidden_devices: Vec::new(),
