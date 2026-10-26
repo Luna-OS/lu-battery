@@ -36,8 +36,10 @@
 //! (64 bytes, CRC-16/XMODEM over the report with the CRC bytes zero); the
 //! bridge acks via GetInputReport(0x02) with `'O'` (taken) or `'F'` (busy).
 //! Replies arrive as input reports. 500 ms timeout per reply; the poller asks
-//! at most once per `poll_secs`. In between, a passive listener picks up the
-//! unsolicited events. The value is the device's percent: raw/raw_max = pct/100.
+//! at most every 5 s (`BARRACUDA_MIN_INTERVAL`, agreed with luna). In between, a
+//! passive listener picks up the unsolicited events (cable plugged or pulled,
+//! battery while charging); repeated identical events are ignored.
+//! The value is the device's percent: raw/raw_max = pct/100.
 
 use super::{Interface, RawBattery, ReadError};
 use crate::model::Charging;
@@ -332,6 +334,8 @@ fn to_raw(pct: u8, cable: Option<bool>) -> RawBattery {
 struct Passive {
     /// Battery percent from an event that the poller has not used yet.
     fresh_pct: Option<u8>,
+    /// Last battery percent seen in an event.
+    last_pct: Option<u8>,
     cable: Option<bool>,
 }
 
@@ -367,14 +371,21 @@ impl Listener {
                             continue;
                         };
                         let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
-                        match (cmd, value) {
-                            (CMD_BATTERY, [p, ..]) if *p <= 100 => s.fresh_pct = Some(*p),
-                            (CMD_CABLE, [c, ..]) => s.cable = Some(*c != 0),
-                            _ => continue,
-                        }
+                        // While charging the headset repeats the cable event
+                        // every few seconds; only real changes count.
+                        let changed = match (cmd, value) {
+                            (CMD_BATTERY, [p, ..]) if *p <= 100 => {
+                                s.fresh_pct = Some(*p);
+                                s.last_pct.replace(*p) != Some(*p)
+                            }
+                            (CMD_CABLE, [c, ..]) => s.cable.replace(*c != 0) != Some(*c != 0),
+                            _ => false,
+                        };
                         drop(s);
-                        log::info!("barracuda event {cmd:02x} {value:02x?}");
-                        on_event();
+                        log::debug!("barracuda event {cmd:02x} {value:02x?}");
+                        if changed {
+                            on_event();
+                        }
                     }
                 }
                 al.store(false, Ordering::Relaxed);

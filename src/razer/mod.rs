@@ -3,13 +3,15 @@
 //! A background thread enumerates Razer HID devices, reads every known device
 //! with a battery every `poll_secs` (or right away on [`Command::RefreshNow`]
 //! and when a device is plugged in or out) and sends the full device list to
-//! the app over a channel.
+//! the app over a channel. When Razer Synapse logs a battery change for a
+//! device (see `synapse.rs`), that device is read over HID at once.
 
 pub mod barracuda;
 pub mod devices;
 pub mod protocol;
+pub mod synapse;
 
-use crate::model::{BatteryReading, Charging, DeviceStatus, Link};
+use crate::model::{BatteryReading, Charging, DeviceStatus, Link, ReadSource};
 use devices::{DeviceInfo, Driver, RAZER_VID};
 use eframe::egui;
 use hidapi::{HidApi, HidDevice};
@@ -25,10 +27,13 @@ const HOTPLUG_INTERVAL: Duration = Duration::from_secs(3);
 /// may talk to the device at the same time) gets a turn.
 const REQUEST_GAP: Duration = Duration::from_millis(25);
 
-/// Messages from the app to the polling thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Messages to the polling thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// Re-enumerate and read every device.
     RefreshNow,
+    /// Read one device (by id) right away, e.g. after Synapse logged news.
+    RefreshDevice(String),
     SetPollSecs(u32),
     Quit,
 }
@@ -229,6 +234,9 @@ fn read_device(
 // ---------------------------------------------------------------------------
 // Polling thread
 
+/// The Barracuda's E1 01 → GET → E1 00 sequence runs at most this often.
+const BARRACUDA_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
 pub struct Handle {
     pub commands: Sender<Command>,
     pub updates: Receiver<Vec<DeviceStatus>>,
@@ -249,7 +257,60 @@ pub fn spawn(ctx: egui::Context, poll_secs: u32) -> Handle {
 }
 
 fn poll_interval(secs: u32) -> Duration {
-    Duration::from_secs(u64::from(secs.clamp(5, 300)))
+    Duration::from_secs(u64::from(secs.clamp(2, 300)))
+}
+
+/// What the next poll has to read.
+#[derive(Debug, Default, PartialEq, Eq)]
+enum Due {
+    #[default]
+    Nothing,
+    /// Only these devices (Synapse or the headset reported news).
+    Devices(BTreeSet<String>),
+    All,
+}
+
+impl Due {
+    fn add(&mut self, other: Due) {
+        *self = match (std::mem::take(self), other) {
+            (Due::All, _) | (_, Due::All) => Due::All,
+            (Due::Nothing, d) | (d, Due::Nothing) => d,
+            (Due::Devices(mut a), Due::Devices(b)) => {
+                a.extend(b);
+                Due::Devices(a)
+            }
+        };
+    }
+}
+
+struct Loop {
+    interval: Duration,
+    next_poll: Instant,
+    next_scan: Instant,
+    due: Due,
+}
+
+impl Loop {
+    /// Applies one command; `false` means the thread should stop.
+    fn handle(&mut self, cmd: Command) -> bool {
+        match cmd {
+            Command::RefreshNow => {
+                // Re-enumerate too, so a freshly plugged dongle shows up.
+                self.next_scan = Instant::now();
+                self.due.add(Due::All);
+            }
+            Command::RefreshDevice(id) => self.due.add(Due::Devices(BTreeSet::from([id]))),
+            Command::SetPollSecs(s) => {
+                let new = poll_interval(s);
+                if new != self.interval {
+                    self.next_poll = self.next_poll - self.interval + new;
+                    self.interval = new;
+                }
+            }
+            Command::Quit => return false,
+        }
+        true
+    }
 }
 
 fn poll_loop(
@@ -266,88 +327,69 @@ fn poll_loop(
             return;
         }
     };
-    let mut interval = poll_interval(poll_secs);
-    let mut poller = Poller {
-        refresh: self_tx,
-        ..Poller::default()
+    let synapse = {
+        let tx = self_tx.clone();
+        synapse::start(move |id| {
+            log::debug!("synapse news for {id}");
+            let _ = tx.send(Command::RefreshDevice(id.to_string()));
+        })
     };
-    let mut next_poll = Instant::now();
-    let mut next_scan = Instant::now() + HOTPLUG_INTERVAL;
+    let mut poller = Poller::new(self_tx, synapse);
     let mut present = enumerate(&api);
-    let mut force = true;
+    let mut state = Loop {
+        interval: poll_interval(poll_secs),
+        next_poll: Instant::now(),
+        next_scan: Instant::now() + HOTPLUG_INTERVAL,
+        due: Due::All,
+    };
 
     loop {
         let now = Instant::now();
-        if now >= next_scan {
-            next_scan = now + HOTPLUG_INTERVAL;
+        if now >= state.next_scan {
+            state.next_scan = now + HOTPLUG_INTERVAL;
             if let Err(e) = api.refresh_devices() {
                 log::warn!("refresh_devices: {e}");
             }
             let fresh = enumerate(&api);
             if pids(&fresh) != pids(&present) {
                 log::info!("device set changed");
-                force = true;
+                state.due.add(Due::All);
             }
             present = fresh;
         }
-        if force || now >= next_poll {
-            force = false;
-            let list = poller.poll(&api, &present, interval);
+        if now >= state.next_poll {
+            state.due.add(Due::All);
+        }
+        let due = std::mem::take(&mut state.due);
+        if due != Due::Nothing {
+            let list = poller.poll(&api, &present, &due);
             if updates.send(list).is_err() {
                 return;
             }
             ctx.request_repaint();
-            next_poll = Instant::now() + interval;
+            if due == Due::All {
+                state.next_poll = Instant::now() + state.interval;
+            }
         }
 
-        let wait = next_poll
-            .min(next_scan)
+        let wait = state
+            .next_poll
+            .min(state.next_scan)
             .saturating_duration_since(Instant::now());
-        let first = commands.recv_timeout(wait);
-        // Several queued refresh requests make one refresh.
-        let mut next = Some(first);
+        let mut next = match commands.recv_timeout(wait) {
+            Ok(cmd) => Some(cmd),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        // Everything queued is handled before the next poll, so several
+        // refresh requests make one poll.
         while let Some(cmd) = next.take() {
-            if !handle_command(
-                cmd,
-                &mut interval,
-                &mut next_poll,
-                &mut next_scan,
-                &mut force,
-            ) {
+            if !state.handle(cmd) {
                 return;
             }
-            next = commands.try_recv().ok().map(Ok);
+            next = commands.try_recv().ok();
         }
     }
-}
-
-/// Applies one command; `false` means the thread should stop.
-fn handle_command(
-    cmd: Result<Command, RecvTimeoutError>,
-    interval: &mut Duration,
-    next_poll: &mut Instant,
-    next_scan: &mut Instant,
-    force: &mut bool,
-) -> bool {
-    {
-        match cmd {
-            Ok(Command::RefreshNow) => {
-                // Re-enumerate too, so a freshly plugged dongle shows up.
-                *next_scan = Instant::now();
-                *force = true;
-            }
-            Ok(Command::SetPollSecs(s)) => {
-                let new = poll_interval(s);
-                if new != *interval {
-                    *next_poll = *next_poll - *interval + new;
-                    *interval = new;
-                }
-            }
-            Ok(Command::Quit) | Err(RecvTimeoutError::Disconnected) => return false,
-            Err(RecvTimeoutError::Timeout) => {}
-        }
-    }
-    true
 }
 
 fn pids(p: &[Present]) -> BTreeSet<u16> {
@@ -364,22 +406,23 @@ struct Poller {
     last_active: HashMap<u16, Instant>,
     /// Lets a listener ask for a refresh after a headset event.
     refresh: Sender<Command>,
+    /// Latest values from Synapse's logs (fallback only).
+    synapse: synapse::Values,
 }
 
-impl Default for Poller {
-    fn default() -> Self {
+impl Poller {
+    fn new(refresh: Sender<Command>, synapse: synapse::Values) -> Self {
         Self {
             last: HashMap::new(),
             preferred: HashMap::new(),
             listeners: HashMap::new(),
             last_active: HashMap::new(),
-            refresh: mpsc::channel().0,
+            refresh,
+            synapse,
         }
     }
-}
 
-impl Poller {
-    fn poll(&mut self, api: &HidApi, present: &[Present], interval: Duration) -> Vec<DeviceStatus> {
+    fn poll(&mut self, api: &HidApi, present: &[Present], due: &Due) -> Vec<DeviceStatus> {
         self.update_listeners(api, present);
         // Group wired + wireless variants of the same device; wired first,
         // because the cable connection also reports charging reliably.
@@ -393,83 +436,102 @@ impl Poller {
         }
         let mut out = Vec::new();
         for (id, mut variants) in groups {
-            variants.sort_by_key(|p| !p.info.wired);
-            let mut result = Err(ReadError::Failed("nicht gelesen".into()));
-            for p in &variants {
-                let mut pref = self.preferred.get(&p.info.pid).cloned();
-                // The Barracuda's active query is asked at most once per
-                // poll interval, whatever triggered this poll.
-                let allow_active = match p.info.driver {
-                    Driver::Standard { .. } => true,
-                    Driver::Barracuda => self
-                        .last_active
-                        .get(&p.info.pid)
-                        .is_none_or(|t| t.elapsed() + Duration::from_secs(1) >= interval),
-                };
-                if allow_active && p.info.driver == Driver::Barracuda {
-                    self.last_active.insert(p.info.pid, Instant::now());
-                }
-                let listener = self.listeners.get(&p.info.pid);
-                result = read_device(api, p, &mut pref, listener, allow_active);
-                if let Some(path) = pref {
-                    self.preferred.insert(p.info.pid, path);
-                }
-                if result.is_ok() {
-                    break;
-                }
-                thread::sleep(REQUEST_GAP);
-            }
-            let info = variants[0].info;
-            let prev = self.last.get(&id).and_then(|s| s.battery);
-            let status = match result {
-                Err(ReadError::NotDue) if self.last.contains_key(&id) => {
-                    out.push(self.last[&id].clone());
-                    continue;
-                }
-                Err(ReadError::NotDue) => DeviceStatus {
-                    id: id.clone(),
-                    name: info.name.into(),
-                    kind: info.kind,
-                    link: Link::Error("noch nicht gelesen".into()),
-                    battery: None,
-                },
-                Ok(b) => DeviceStatus {
-                    id: id.clone(),
-                    name: info.name.into(),
-                    kind: info.kind,
-                    link: Link::Online,
-                    battery: Some(BatteryReading {
-                        raw: b.raw,
-                        raw_max: b.raw_max,
-                        charging: b.charging,
-                        read_at: Instant::now(),
-                    }),
-                },
-                Err(ReadError::Asleep) => DeviceStatus {
-                    id: id.clone(),
-                    name: info.name.into(),
-                    kind: info.kind,
-                    link: Link::Asleep,
-                    battery: prev,
-                },
-                Err(ReadError::Failed(msg)) => {
-                    log::warn!("{id}: {msg}");
-                    DeviceStatus {
-                        id: id.clone(),
-                        name: info.name.into(),
-                        kind: info.kind,
-                        link: Link::Error(msg),
-                        battery: prev,
-                    }
-                }
+            let wanted = match due {
+                Due::All => true,
+                Due::Devices(ids) => ids.contains(&id),
+                Due::Nothing => false,
             };
+            if !wanted && let Some(last) = self.last.get(&id) {
+                out.push(last.clone());
+                continue;
+            }
+            variants.sort_by_key(|p| !p.info.wired);
+            let status = self.read_group(api, &id, &variants);
             self.last.insert(id, status.clone());
             out.push(status);
-            thread::sleep(REQUEST_GAP);
         }
         // Forget devices that were unplugged.
         self.last.retain(|id, _| out.iter().any(|s| &s.id == id));
         out
+    }
+
+    fn read_group(&mut self, api: &HidApi, id: &str, variants: &[&Present]) -> DeviceStatus {
+        let mut result = Err(ReadError::Failed("nicht gelesen".into()));
+        for p in variants {
+            let mut pref = self.preferred.get(&p.info.pid).cloned();
+            // The Barracuda's active query runs at most every
+            // BARRACUDA_MIN_INTERVAL, whatever triggered this poll.
+            let allow_active = match p.info.driver {
+                Driver::Standard { .. } => true,
+                Driver::Barracuda => self
+                    .last_active
+                    .get(&p.info.pid)
+                    .is_none_or(|t| t.elapsed() >= BARRACUDA_MIN_INTERVAL),
+            };
+            if allow_active && p.info.driver == Driver::Barracuda {
+                self.last_active.insert(p.info.pid, Instant::now());
+            }
+            let listener = self.listeners.get(&p.info.pid);
+            result = read_device(api, p, &mut pref, listener, allow_active);
+            if let Some(path) = pref {
+                self.preferred.insert(p.info.pid, path);
+            }
+            if result.is_ok() {
+                break;
+            }
+            thread::sleep(REQUEST_GAP);
+        }
+        thread::sleep(REQUEST_GAP);
+
+        let info = variants[0].info;
+        let prev = self.last.get(id);
+        let status = |link, battery| DeviceStatus {
+            id: id.to_string(),
+            name: info.name.into(),
+            kind: info.kind,
+            link,
+            battery,
+        };
+        match result {
+            Ok(b) => status(
+                Link::Online,
+                Some(BatteryReading {
+                    source: ReadSource::Hid,
+                    raw: b.raw,
+                    raw_max: b.raw_max,
+                    charging: b.charging,
+                    read_at: Instant::now(),
+                }),
+            ),
+            Err(ReadError::NotDue) => match prev {
+                Some(prev) => prev.clone(),
+                None => status(Link::Error("noch nicht gelesen".into()), None),
+            },
+            Err(ReadError::Asleep) => status(Link::Asleep, prev.and_then(|s| s.battery)),
+            Err(ReadError::Failed(msg)) => {
+                log::warn!("{id}: {msg}");
+                let from_synapse = self
+                    .synapse
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(id)
+                    .copied();
+                match from_synapse {
+                    // HID failed: Synapse's own reading is the next best thing.
+                    Some(v) => status(
+                        Link::Online,
+                        Some(BatteryReading {
+                            source: ReadSource::Synapse,
+                            raw: u16::from(v.percent),
+                            raw_max: 100,
+                            charging: v.charging,
+                            read_at: v.at,
+                        }),
+                    ),
+                    None => status(Link::Error(msg), prev.and_then(|s| s.battery)),
+                }
+            }
+        }
     }
 
     fn update_listeners(&mut self, api: &HidApi, present: &[Present]) {
@@ -480,8 +542,9 @@ impl Poller {
                 continue;
             }
             let tx = self.refresh.clone();
+            let id = p.info.id();
             let on_event = move || {
-                let _ = tx.send(Command::RefreshNow);
+                let _ = tx.send(Command::RefreshDevice(id.clone()));
             };
             if let Some(l) = barracuda::Listener::start(api, &p.interfaces, on_event) {
                 self.listeners.insert(p.info.pid, l);
@@ -568,5 +631,7 @@ pub fn probe() -> anyhow::Result<()> {
             Driver::Barracuda => barracuda::probe(&api, &p.interfaces),
         }
     }
+    println!();
+    synapse::probe();
     Ok(())
 }

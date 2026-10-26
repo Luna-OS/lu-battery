@@ -1,6 +1,6 @@
 //! Tray icon with menu and battery tooltip. Owned by `code`.
 
-use crate::model::{Charging, DeviceStatus, Link};
+use crate::model::{Charging, DeviceStatus, Link, ReadSource};
 use eframe::egui;
 use std::sync::mpsc::{self, Receiver};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -139,7 +139,11 @@ pub fn tooltip_text(devices: &[DeviceStatus], precise: bool) -> String {
                 } else {
                     ""
                 };
-                format!("{pct}{state}{stale}")
+                let source = match b.source {
+                    ReadSource::Synapse => " (Synapse)",
+                    ReadSource::Hid => "",
+                };
+                format!("{pct}{state}{source}{stale}")
             }
             (Link::Error(msg), None) => msg.clone(),
             (Link::Online, None) => "–".to_string(),
@@ -259,6 +263,7 @@ mod tests {
             kind: DeviceKind::Mouse,
             link,
             battery: raw.map(|raw| BatteryReading {
+                source: ReadSource::Hid,
                 raw,
                 raw_max: 255,
                 charging,

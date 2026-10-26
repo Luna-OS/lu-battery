@@ -60,7 +60,7 @@ pub fn sanitize(mut s: Settings) -> Settings {
     ];
     s.scale = finite(s.scale, d.scale).clamp(0.75, 2.0);
     s.opacity = finite(s.opacity, d.opacity).clamp(0.0, 1.0);
-    s.poll_secs = s.poll_secs.clamp(5, 300);
+    s.poll_secs = s.poll_secs.clamp(2, 300);
     s.low_threshold = s.low_threshold.min(100);
     s.critical_threshold = s.critical_threshold.min(s.low_threshold);
     s
@@ -160,7 +160,7 @@ mod tests {
         });
         assert_eq!(s.scale, 2.0);
         assert_eq!(s.opacity, 0.0);
-        assert_eq!(s.poll_secs, 5);
+        assert_eq!(s.poll_secs, 2);
         assert_eq!(s.critical_threshold, 15);
         assert_eq!(s.margin, Settings::default().margin);
     }
