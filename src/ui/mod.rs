@@ -5,7 +5,8 @@ pub mod theme;
 pub mod widgets;
 
 use crate::model::{
-    Anchor, BatteryReading, Charging, DeviceKind, DeviceStatus, Layout, Link, Settings, UiAction,
+    Anchor, BatteryReading, Charging, DeviceKind, DeviceStatus, Layout, Link, ReadSource, Settings,
+    UiAction,
 };
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Painter, PointerButton, Rect, RichText, Sense,
@@ -636,9 +637,16 @@ fn device_row(ui: &mut egui::Ui, d: &DeviceStatus, settings: &mut Settings) {
                     if b.charging != Charging::Discharging {
                         t = format!("{t}  ·  {}", charging_text(b.charging));
                     }
+                    let source = match b.source {
+                        ReadSource::Hid => "direkt vom Gerät",
+                        ReadSource::Synapse => "via Synapse",
+                    };
+                    if b.source == ReadSource::Synapse {
+                        t = format!("{t}  ·  {source}");
+                    }
                     ui.label(RichText::new(t).monospace().color(theme::muted()))
                         .on_hover_text(format!(
-                            "Rohwert vom Gerät: {} von {}\nZuletzt gelesen vor {} s",
+                            "Rohwert {source}: {} von {}\nZuletzt gelesen vor {} s",
                             b.raw,
                             b.raw_max,
                             b.read_at.elapsed().as_secs()
@@ -854,7 +862,7 @@ fn settings_body(
             });
             row(ui, "Abfrage alle", |ui| {
                 ui.add(
-                    egui::Slider::new(&mut settings.poll_secs, 5..=300)
+                    egui::Slider::new(&mut settings.poll_secs, 2..=300)
                         .logarithmic(true)
                         .suffix(" s"),
                 );

@@ -11,11 +11,15 @@ mod model;
 mod ui;
 
 use eframe::egui::{self, Color32, CornerRadius, Mesh, Pos2, Rect, RichText, pos2, vec2};
-use model::{BatteryReading, Charging, DeviceKind, DeviceStatus, Layout, Link, Settings, UiAction};
+use model::{
+    BatteryReading, Charging, DeviceKind, DeviceStatus, Layout, Link, ReadSource, Settings,
+    UiAction,
+};
 use std::time::Instant;
 
 fn reading(raw: u16, raw_max: u16, charging: Charging) -> Option<BatteryReading> {
     Some(BatteryReading {
+        source: ReadSource::Hid,
         raw,
         raw_max,
         charging,
