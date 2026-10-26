@@ -33,7 +33,6 @@ pub const WARNING: Color32 = hex(0xf3c766);
 pub const ERROR: Color32 = hex(0xe5626b);
 pub const SELECTION: Color32 = hex(0x3b2e6b);
 pub const LAVENDER400: Color32 = hex(0xb9aefb);
-pub const LAVENDER600: Color32 = hex(0x8f82e0);
 pub const OUTLINE: Color32 = hex(0x5b4f9e);
 
 /// surface + 18 % lavender400.
