@@ -14,6 +14,7 @@ pub enum DeviceKind {
 }
 
 /// Charging state as reported by the device itself.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Charging {
     Charging,
